@@ -94,17 +94,16 @@ def group_of(name: str) -> str:
 
 
 def parameter_rows(model) -> list[dict]:
-    """Все тензоры параметров модели.
-
-    remove_duplicate=False — иначе в таблицу не попадёт lm_head.
-    """
     rows = []
+    seen = set()
     for name, param in model.named_parameters(remove_duplicate=False):
+        tied = id(param) in seen
+        seen.add(id(param))
         rows.append({
             "name": name,
             "shape": tuple(param.shape),
             "numel": param.numel(),
-            "tied": False,
+            "tied": tied,
         })
     return rows
 
@@ -156,9 +155,9 @@ def hook_targets(model) -> dict[str, int]:
     return {"первый": 0, "средний": n_layers // 2, "последний": n_layers - 1}
 
 
-def forward_hooks(modules: dict) -> dict:
-    """Навесить forward-hooks на модули и вернуть словарь, куда они пишут."""
+def forward_hooks(modules: dict):
     store: dict[str, list[float]] = {}
+    handles = []
 
     def make_hook(label: str):
         def hook(module, args, output):
@@ -167,20 +166,23 @@ def forward_hooks(modules: dict) -> dict:
         return hook
 
     for label, module in modules.items():
-        module.register_forward_hook(make_hook(label))
-    return store
+        handles.append(module.register_forward_hook(make_hook(label)))
+    return store, handles
 
 
 def activation_norms(tokenizer, model, params: dict) -> dict:
-    """L2-нормы скрытых состояний на выходе трёх блоков, по позициям токена."""
     layers = decoder_layers(model)
     targets = hook_targets(model)
     prompt = build_prompt(tokenizer, params, params["hooks"]["prompt"])
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-    store = forward_hooks({label: layers[i] for label, i in targets.items()})
-    with torch.inference_mode():
-        model(**inputs)
+    store, handles = forward_hooks({label: layers[i] for label, i in targets.items()})
+    try:
+        with torch.inference_mode():
+            model(**inputs)
+    finally:
+        for h in handles:
+            h.remove()
 
     return {
         "layers": targets,
@@ -188,30 +190,34 @@ def activation_norms(tokenizer, model, params: dict) -> dict:
         "n_tokens": inputs["input_ids"].shape[1],
     }
 
-
 # --------------------------------------------------------------------------
 # 3. Сколько параметров добавляет LoRA
 # --------------------------------------------------------------------------
 
 def lora_config(params: dict, cfg: dict) -> LoraConfig:
-    """LoraConfig из params.yaml — ни r, ни target_modules в коде не зашиты."""
+    target_modules = cfg["target_modules"]
+    if not isinstance(target_modules, str):
+        target_modules = list(target_modules)
     return LoraConfig(
         r=cfg["r"],
         lora_alpha=params["lora"]["alpha_ratio"] * cfg["r"],
         lora_dropout=params["lora"]["dropout"],
-        target_modules=list(cfg["target_modules"]),
+        target_modules=target_modules,
         bias="none",
         task_type="CAUSAL_LM",
     )
 
 
 def lora_params_formula(model, r: int, target_modules) -> int:
-    """Своя формула: на каждый целевой Linear ровно r * (in_features + out_features).
+    if isinstance(target_modules, str) and target_modules == "all-linear":
+        targets = {
+            name.rsplit(".", 1)[-1]
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.Linear)
+        }
+    else:
+        targets = set(target_modules)
 
-    A имеет форму (r, in), B — (out, r), смещений у них нет. Вся арифметика
-    LoRA умещается в эту строчку, и она обязана сойтись с peft до штуки.
-    """
-    targets = set(target_modules)
     total = 0
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear) and name.rsplit(".", 1)[-1] in targets:
@@ -253,15 +259,18 @@ def lora_report(model, params: dict) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def device_allocated_bytes(device: torch.device) -> int:
-    """Сколько памяти занято прямо сейчас."""
-    used, _ = peak_rss()
-    return used
-
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated(device)
+    if device.type == "mps":
+        return torch.mps.driver_allocated_memory()
+    return peak_rss()[0]
 
 def device_metric_source(device: torch.device) -> str:
-    """Имя функции, которой снята память."""
-    _, source = peak_rss()
-    return source
+    if device.type == "cuda":
+        return "torch.cuda.max_memory_allocated"
+    if device.type == "mps":
+        return "torch.mps.driver_allocated_memory"
+    return peak_rss()[1]
 
 
 def peak_rss() -> tuple[int, str]:
@@ -301,6 +310,8 @@ class PeakMemory:
         self.used = 0
 
     def __enter__(self) -> "PeakMemory":
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
         return self
 
     def __exit__(self, *exc) -> bool:
@@ -377,22 +388,24 @@ def measure_mode(mode: str, params: dict) -> dict:
     return result
 
 
-def memory_profile(params: dict) -> list[dict]:
-    """Профиль памяти в трёх режимах.
+import subprocess
 
-    memory.repeats задаёт число прогонов на режим; берётся худший (максимум).
-    """
+def memory_profile(params: dict) -> list[dict]:
     repeats = max(1, int(params["memory"].get("repeats", 1)))
     results = []
     for mode in MODES:
-        runs = [measure_mode(mode, params) for _ in range(repeats)]
+        runs = []
+        for _ in range(repeats):
+            out = subprocess.check_output(
+                [sys.executable, "-m", "src.inspect_model", "--probe", mode],
+                text=True, encoding="utf-8"
+            )
+            runs.append(json.loads(out.strip().splitlines()[-1]))
         worst = max(runs, key=lambda item: item["peak_mb"])
         worst["repeats"] = repeats
         worst["peak_mb_runs"] = [item["peak_mb"] for item in runs]
         results.append(worst)
-        gc.collect()
     return results
-
 
 # --------------------------------------------------------------------------
 # 5. Условия, без которых цифры замера ничего не значат
@@ -440,7 +453,7 @@ def main() -> None:
     params["model"]["device"] = str(resolve_device(params))
 
     if args.probe:
-        print(json.dumps(measure_mode(args.probe, params), ensure_ascii=False))
+        print(json.dumps(measure_mode(args.probe, params), ensure_ascii=True))
         return
 
     # Импорт здесь, а не наверху: matplotlib не нужен в служебных --probe

@@ -1,0 +1,1 @@
+{"peak_mb": 1880.0, "peak_device_mb": 1880.0, "peak_rss_mb": 1880.0, "metric": "RSS \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u0430", "metric_source": "peak_wset", "rss_source": "peak_wset", "mode": "inference", "device": "cpu", "seq_len": 256, "batch_size": 1, "seconds": 19.8, "loss": null}
